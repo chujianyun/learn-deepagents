@@ -49,6 +49,8 @@
   let abortCtrl = null;
   let liveMsg = null;          // 正在流式输出的 assistant 消息
   let liveConv = null;
+  // 提示词增强请求状态：{ id, convId, beforeText, afterText, ctrl, pending }
+  let enhanceReq = null;
 
   const segNodes = new WeakMap();   // segment -> DOM
   const msgNodes = new WeakMap();   // message -> DOM
@@ -65,6 +67,10 @@
   const messagesEl = $('#messages');
   const inputEl = $('#input');
   const sendBtn = $('#sendBtn');
+  const enhanceBtn = $('#enhanceBtn');
+  const composerBox = $('#composerBox');
+  const enhanceRestore = $('#enhanceRestore');
+  const enhanceRestoreBtn = $('#enhanceRestoreBtn');
   const searchToggle = $('#searchToggle');
   const modelBtn = $('#modelBtn');
   const modelBtnName = $('#modelBtnName');
@@ -652,6 +658,7 @@
   function send() {
     const text = inputEl.value.trim();
     if (!text || streaming) return;
+    cancelEnhance();  // 发送后丢弃进行中的增强与还原记录，避免覆盖已清空的输入框
     const conv = ensureConversation();
     conv.messages.push({ role: 'user', id: uid(), content: text, model: settings.model, search: settings.search });
     if (conv.title === '新对话') conv.title = text.replace(/\s+/g, ' ').slice(0, 30);
@@ -703,6 +710,7 @@
   // ---------- 会话操作 ----------
   function openConversation(id) {
     if (streaming && liveConv && liveConv.id !== id) stopStream();
+    cancelEnhance();  // 会话隔离：切换会话时取消增强，不覆盖另一个会话的输入
     currentId = id;
     save();
     renderSidebar();
@@ -713,6 +721,7 @@
 
   function newChat() {
     if (streaming) stopStream();
+    cancelEnhance();
     currentId = null;
     save();
     renderSidebar();
@@ -836,7 +845,21 @@
     sendBtn.disabled = streaming ? false : !inputEl.value.trim();
   }
 
-  inputEl.addEventListener('input', () => { autoResize(); updateSendBtn(); });
+  inputEl.addEventListener('input', () => {
+    autoResize();
+    updateSendBtn();
+    if (enhanceReq) {
+      if (enhanceReq.pending) {
+        // 增强期间手动编辑：使当前请求失效，避免覆盖用户新内容
+        enhanceReq.ctrl.abort();
+        clearEnhanceRecord();
+        setEnhanceUI(false);
+      } else if (enhanceReq.afterText != null && inputEl.value !== enhanceReq.afterText) {
+        // 增强后手动编辑：清除还原记录，避免一键还原覆盖后续编辑
+        clearEnhanceRecord();
+      }
+    }
+  });
   inputEl.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && e.keyCode !== 229) {
       e.preventDefault();
@@ -845,6 +868,100 @@
   });
 
   sendBtn.addEventListener('click', () => { streaming ? stopStream() : send(); });
+
+  // ---------- 提示词增强 ----------
+  // 调用后端「提示词增强子智能体」改写输入，增强结果覆盖输入框；
+  // 支持取消、还原、手动编辑失效与会话隔离，不自动发送。
+  function setEnhanceUI(on) {
+    enhanceBtn.classList.toggle('enhancing', on);
+    // SVG 没有 hidden 属性反射，用 toggleAttribute 操作内容属性
+    enhanceBtn.querySelector('.icon-sparkle').toggleAttribute('hidden', on);
+    enhanceBtn.querySelector('.enhance-spinner').toggleAttribute('hidden', !on);
+    enhanceBtn.dataset.tooltip = on ? '取消增强' : '提示词增强';
+    enhanceBtn.setAttribute('aria-label', on ? '取消增强' : '提示词增强');
+    composerBox.classList.toggle('enhancing', on);
+  }
+
+  function clearEnhanceRecord() {
+    enhanceReq = null;
+    enhanceRestore.hidden = true;
+  }
+
+  // 取消进行中的增强：丢弃迟到结果，保留输入框当前内容
+  function cancelEnhance() {
+    if (enhanceReq && enhanceReq.pending) enhanceReq.ctrl.abort();
+    clearEnhanceRecord();
+    setEnhanceUI(false);
+  }
+
+  async function startEnhance() {
+    const text = inputEl.value.replace(/\u200B/g, '').trim();
+    if (!text) {
+      toast('请先输入需要增强的提示词');
+      inputEl.focus();
+      return;
+    }
+    const ctrl = new AbortController();
+    const req = {
+      id: uid(), convId: currentId, beforeText: inputEl.value,
+      afterText: null, ctrl, pending: true,
+    };
+    enhanceReq = req;
+    enhanceRestore.hidden = true;
+    setEnhanceUI(true);
+    try {
+      const resp = await fetch('/api/enhance', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text, model: settings.model }),
+        signal: ctrl.signal,
+      });
+      const data = await resp.json().catch(() => null);
+      // 请求已被取消/取代/切换会话：丢弃迟到结果，不覆盖输入框
+      if (enhanceReq !== req || ctrl.signal.aborted) return;
+      if (!resp.ok || !data) throw new Error((data && data.error) || `服务返回 HTTP ${resp.status}`);
+      if (!data.success) {
+        if (data.code === 'empty_input') toast('请先输入需要增强的提示词');
+        else throw new Error(data.error || '增强失败');
+        clearEnhanceRecord();
+        setEnhanceUI(false);
+        return;
+      }
+      const enhanced = (data.text || '').trim();
+      if (!enhanced) throw new Error('增强结果为空');
+      if (enhanceReq !== req || ctrl.signal.aborted) return;
+      req.afterText = enhanced;
+      req.pending = false;
+      inputEl.value = enhanced;          // 增强后的提示词覆盖用户输入
+      autoResize();
+      updateSendBtn();
+      setEnhanceUI(false);
+      enhanceRestore.hidden = false;     // 展示「还原」
+      inputEl.focus();
+      inputEl.setSelectionRange(enhanced.length, enhanced.length);
+      if (data.fallback) toast(`已使用 ${modelInfo(data.model).name} 完成增强`);
+    } catch (err) {
+      if (enhanceReq !== req) return;    // 已被取代，交由新请求管理 UI
+      if (err.name !== 'AbortError') toast(err.message || '提示词增强失败，请重试');
+      clearEnhanceRecord();
+      setEnhanceUI(false);
+    }
+  }
+
+  enhanceBtn.addEventListener('click', () => {
+    if (enhanceReq && enhanceReq.pending) cancelEnhance();
+    else startEnhance();
+  });
+
+  enhanceRestoreBtn.addEventListener('click', () => {
+    if (!enhanceReq || enhanceReq.afterText == null) return;
+    inputEl.value = enhanceReq.beforeText;
+    autoResize();
+    updateSendBtn();
+    clearEnhanceRecord();
+    inputEl.focus();
+    toast('已还原原始提示词');
+  });
 
   // ---------- 侧边栏开合 ----------
   const isMobile = () => window.matchMedia('(max-width: 768px)').matches;

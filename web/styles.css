@@ -917,6 +917,115 @@ button {
 .send-btn:disabled { background: #bfccf9; cursor: default; }
 .send-btn svg { width: 17px; height: 17px; }
 
+/* ---- 提示词增强按钮（发送按钮左侧） ---- */
+.enhance-btn {
+  position: relative;
+  width: 33px;
+  height: 33px;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-secondary);
+  background: transparent;
+  border: 1px solid #dce1ea;
+  transition: color 0.15s, border-color 0.15s, background 0.15s, transform 0.1s;
+  flex-shrink: 0;
+}
+.enhance-btn:hover { color: var(--blue); border-color: var(--blue-border); background: var(--blue-softer); }
+.enhance-btn:active { transform: scale(0.93); }
+.enhance-btn svg { width: 17px; height: 17px; }
+.enhance-btn.enhancing {
+  color: var(--blue);
+  border-color: var(--blue-border);
+  background: var(--blue-light);
+}
+
+/* 自定义 tooltip：hover/focus 时在按钮上方显示「提示词增强」 */
+.enhance-btn::after {
+  content: attr(data-tooltip);
+  position: absolute;
+  bottom: calc(100% + 9px);
+  left: 50%;
+  transform: translateX(-50%) translateY(3px);
+  background: rgba(31, 35, 41, 0.92);
+  color: #fff;
+  font-size: 12px;
+  line-height: 1;
+  padding: 6px 9px;
+  border-radius: 7px;
+  white-space: nowrap;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.15s, transform 0.15s;
+  z-index: 20;
+}
+.enhance-btn::before {
+  content: "";
+  position: absolute;
+  bottom: calc(100% + 4px);
+  left: 50%;
+  transform: translateX(-50%);
+  border: 5px solid transparent;
+  border-top-color: rgba(31, 35, 41, 0.92);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.15s;
+  z-index: 20;
+}
+.enhance-btn:hover::after,
+.enhance-btn:focus-visible::after { opacity: 1; transform: translateX(-50%) translateY(0); }
+.enhance-btn:hover::before,
+.enhance-btn:focus-visible::before { opacity: 1; }
+
+.enhance-spinner {
+  width: 15px;
+  height: 15px;
+  border: 2px solid var(--blue-light);
+  border-top-color: var(--blue);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+/* 增强进行中：输入框柔和的蓝色呼吸边框，提示正在改写 */
+.composer.enhancing {
+  border-color: var(--blue-border);
+  background: #fff;
+  animation: enhance-glow 1.6s ease-in-out infinite;
+}
+@keyframes enhance-glow {
+  0%, 100% { box-shadow: 0 0 0 3px rgba(77, 107, 254, 0.08); }
+  50% { box-shadow: 0 0 0 3px rgba(77, 107, 254, 0.18), 0 4px 18px rgba(77, 107, 254, 0.1); }
+}
+
+/* ---- 增强后的「还原」 chip ---- */
+.enhance-restore {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 33px;
+  padding: 0 5px 0 12px;
+  border-radius: 17px;
+  background: var(--blue-softer);
+  border: 1px solid var(--blue-border);
+  color: var(--blue-deep);
+  font-size: 12.5px;
+  user-select: none;
+  animation: fade-up 0.2s ease both;
+}
+.enhance-restore > svg { width: 14px; height: 14px; color: var(--blue); flex-shrink: 0; }
+.enhance-restore-btn {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--blue);
+  background: #fff;
+  border: 1px solid var(--blue-border);
+  border-radius: 12px;
+  padding: 3px 11px;
+  transition: background 0.12s;
+}
+.enhance-restore-btn:hover { background: var(--blue-light); }
+
 .disclaimer {
   text-align: center;
   font-size: 11.5px;
