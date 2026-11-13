@@ -26,6 +26,10 @@
     tavily_search: '联网搜索',
     write_todos: '规划任务',
     task: '委派子智能体',
+    read_file: '读取文件',
+    ls: '浏览目录',
+    glob: '查找文件',
+    grep: '检索内容',
   };
 
   const ICONS = {
