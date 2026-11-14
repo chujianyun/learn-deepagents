@@ -1,8 +1,9 @@
 """DeepSeek 风格智能体聊天界面 —— FastAPI 后端
 
-- 基于 deepagents.create_deep_agent 构建智能体，按「模型 + 联网搜索开关」缓存实例
-- POST /api/chat 以 SSE 流式输出：思考过程 / 正文增量 / 工具调用（联网搜索）/ 完成与错误
+- 基于 deepagents.create_deep_agent 构建智能体，按「模型 + 联网搜索开关 + MCP 配置指纹」缓存实例
+- POST /api/chat 以 SSE 流式输出：思考过程 / 正文增量 / 工具调用（联网搜索 / MCP）/ 完成与错误
 - 模型通过 SiliconFlow 的 OpenAI 兼容接口调用（use_responses_api=False）
+- MCP 服务统一配置在 ~/.my-deepseek/mcp.json（见 mcp_config.py），修改后自动生效
 - 前端静态资源位于 web/ 目录，访问 http://127.0.0.1:8000 即可使用
 
 启动：.venv/bin/python -m uvicorn server:app --host 127.0.0.1 --port 8000
@@ -31,6 +32,8 @@ from deepagents import create_deep_agent
 
 from prompt_enhancer import ENHANCE_SYSTEM_PROMPT, enhance_user_prompt
 from skills_config import SKILLS_SOURCE, skills_backend
+
+from mcp_config import MCPBundle, load_mcp_tools
 
 load_dotenv()
 
@@ -68,15 +71,32 @@ DEFAULT_MODEL = MODELS[0]["id"]
 
 BASE_SYSTEM_PROMPT = (
     "你是 DeepSeek 智能助手，一个友好的中文 AI 助手，运行在网页聊天界面中。"
-    "回答准确、简洁、有条理，善用 Markdown 排版（标题、列表、表格、代码块）。"
+    "回答准确、简洁、有条理：简单事实或概念问题用一两句话直接回答，"
+    "不要堆砌标题、表格、分节或额外解释；只有复杂对比、多步骤任务才用 Markdown 排版。"
+    "严格只回答用户所问：不要补充用户没问的版本历史、参数细节、价格、背景或“顺带一提”类延伸；"
+    "能用一句话答清就不用两句，不要主动添加赏析、总结、延伸建议或追问。"
     "不要创建待办清单；除读取 skill 文件（read_file/grep/glob/ls）外，"
     "不要使用文件写入类工具，日常问题直接对话回答即可。"
     "当用户问题匹配某个 skill 的领域时，先读取对应 SKILL.md 再按 skill 指引回答。"
 )
 SEARCH_PROMPT_SUFFIX = (
     "当前已开启联网搜索：当用户需要人物资料、最新资讯、实时数据或事实核查时，"
-    "必须先调用 tavily_search 工具联网搜索，再基于搜索结果用简洁的中文回答，"
-    "并在结尾列出参考链接。不要编造搜索结果中没有的信息。"
+    "调用 tavily_search 工具联网搜索。每个问题最多搜索 1 次，拿到结果后立即作答；"
+    "禁止换个语言或相近关键词再搜一次，也不要用猜测的答案作为查询词。"
+    "基于搜索结果作答：先用一句话直接回答用户所问，然后立即结束正文（最多不超过 3 句）；"
+    "相关但用户没问的信息一律不写：如未来版本计划、发布日期、参数量、架构、基准、价格、"
+    "周边景点票价、API 调用方式、更新渠道等；参考链接单独列在末尾。"
+    "只陈述搜索结果正文中明确写出的事实：不要从链接 URL、文件名或标题推测日期、版本号等细节，"
+    "也不要把多条结果自行综合推断出结果里没有直接写明的结论（如“目前最新版本是 X”）；"
+    "结果没直接写明或信息矛盾时，如实说明不确定性，不要硬下结论。"
+)
+MCP_PROMPT_SUFFIX = (
+    "当前已接入外部 MCP 服务：{servers}。"
+    "当用户请求涉及这些服务的能力（如瑞幸咖啡点单、查菜单、下单）时，"
+    "必须调用对应的 MCP 工具获取真实数据后再回答，不要编造工具结果；"
+    "工具调用失败时如实告知用户。"
+    "自我介绍或普通问答时不要主动列举这些服务、举例或罗列功能（包括“查文档”“点咖啡”等），"
+    "只有用户显式问“你能做什么/有什么功能”时才介绍能力。"
 )
 
 # ---------- 提示词增强子智能体 ----------
@@ -120,13 +140,16 @@ def tavily_search(query: str) -> str:
     return "\n".join(lines)
 
 
-# 按 (模型, 是否联网) 缓存智能体，避免每次请求重复构建
-_agent_cache: dict[tuple[str, bool], Any] = {}
+# 按 (模型, 是否联网, MCP 配置指纹) 缓存智能体，避免每次请求重复构建；
+# mcp.json 更新后指纹变化，自动构建新实例并清理同模型的旧指纹缓存
+_agent_cache: dict[tuple[str, bool, str], Any] = {}
 
 
-def get_agent(model_id: str, search_enabled: bool):
-    key = (model_id, search_enabled)
+def get_agent(model_id: str, search_enabled: bool, mcp: MCPBundle = MCPBundle([], [], None, "")):
+    key = (model_id, search_enabled, mcp.fingerprint)
     if key not in _agent_cache:
+        for old_key in [k for k in _agent_cache if k[:2] == key[:2]]:
+            del _agent_cache[old_key]
         model = init_chat_model(
             f"openai:{model_id}",
             base_url=os.environ["OPENAI_BASE_URL"],
@@ -136,10 +159,13 @@ def get_agent(model_id: str, search_enabled: bool):
             max_retries=1,
         )
         use_search = search_enabled and _tavily_key_ready()
+        prompt = BASE_SYSTEM_PROMPT + (SEARCH_PROMPT_SUFFIX if use_search else "")
+        if mcp.tools:
+            prompt += MCP_PROMPT_SUFFIX.format(servers="、".join(mcp.servers))
         _agent_cache[key] = create_deep_agent(
             model=model,
-            tools=[tavily_search] if use_search else [],
-            system_prompt=BASE_SYSTEM_PROMPT + (SEARCH_PROMPT_SUFFIX if use_search else ""),
+            tools=([tavily_search] if use_search else []) + mcp.tools,
+            system_prompt=prompt,
             subagents=[],  # 纯聊天场景不需要子智能体，降低时延
             # 与 main.py 共享同一套本地 skills 配置（skills_config.py）
             backend=skills_backend,
@@ -307,9 +333,14 @@ async def _chat_stream(req: ChatRequest, request: Request) -> AsyncGenerator[str
     if req.search and not search_on:
         yield _sse({"type": "notice", "message": "TAVILY_API_KEY 未配置，本次回答未联网。"})
 
+    # MCP 工具按配置文件指纹缓存；未配置/加载失败时降级为普通聊天并提示
+    mcp = await load_mcp_tools()
+    if mcp.notice:
+        yield _sse({"type": "notice", "message": mcp.notice})
+
     agent_attempts = [model_id] + ([DEFAULT_MODEL] if model_id != DEFAULT_MODEL else [])
     for attempt, mid in enumerate(agent_attempts):
-        agent = get_agent(mid, search_on)
+        agent = get_agent(mid, search_on, mcp)
         started_tools: set[str] = set()
         tool_names: dict[str, str] = {}
         emitted = False  # 是否已向前端输出过内容（输出后不再代答，避免重复）
@@ -367,6 +398,9 @@ async def _chat_stream(req: ChatRequest, request: Request) -> AsyncGenerator[str
                                 }
                                 if name == "tavily_search":
                                     evt["sources"] = _parse_search_sources(content_str)
+                                    # 附带搜索正文摘要，供评测做幻觉核查（前端忽略未知字段，向后兼容）。
+                                    # 上限设较高值，保证裁判看到的事实依据与模型所见一致，避免截断造成幻觉误判
+                                    evt["content"] = content_str[:12000]
                                 emitted = True
                                 yield _sse(evt)
             _model_available[mid] = True
@@ -376,6 +410,9 @@ async def _chat_stream(req: ChatRequest, request: Request) -> AsyncGenerator[str
                 "requested_model": model_id,
                 "fallback": attempt > 0,
                 "search": search_on,
+                # 本轮实际可用的外部工具清单，供评测裁判了解智能体能力边界
+                "tools": (["tavily_search"] if search_on else [])
+                + [getattr(t, "name", "") for t in mcp.tools],
             })
             return
         except Exception as exc:

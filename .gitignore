@@ -13,5 +13,8 @@ __pycache__/
 # 早期遗留静态目录（前端资源以 web/ 为准，/static 路由映射到 web/）
 static/
 
+# 运行时产物（评测日志、服务日志）
+data/
+
 # 系统文件
 .DS_Store
